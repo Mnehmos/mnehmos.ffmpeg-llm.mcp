@@ -1,0 +1,81 @@
+name: Gitflow Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  validate-branch:
+    name: Validate Branch Flow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch naming and flow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const base = context.payload.pull_request.base.ref;
+            const head = context.payload.pull_request.head.ref;
+
+            const rules = {
+              // feature/* and fix/* can only merge to develop
+              'feature/': ['develop'],
+              'fix/': ['develop'],
+              'bugfix/': ['develop'],
+              // release/* can merge to main or develop
+              'release/': ['main', 'develop'],
+              // hotfix/* can merge to main or develop
+              'hotfix/': ['main', 'develop'],
+              // develop can merge to main (via release)
+              'develop': ['main'],
+            };
+
+            let allowed = null;
+            for (const [prefix, targets] of Object.entries(rules)) {
+              if (head.startsWith(prefix) || head === prefix) {
+                allowed = targets;
+                break;
+              }
+            }
+
+            if (allowed && !allowed.includes(base)) {
+              core.setFailed(
+                `Gitflow violation: '${head}' should target [${allowed.join(', ')}], not '${base}'.\n\n` +
+                `Branch naming convention:\n` +
+                `  feature/* → develop\n` +
+                `  fix/*     → develop\n` +
+                `  release/* → main or develop\n` +
+                `  hotfix/*  → main or develop\n` +
+                `  develop   → main`
+              );
+            }
+
+            // Validate branch name format
+            const validPatterns = [
+              /^feature\/.+/,
+              /^fix\/.+/,
+              /^bugfix\/.+/,
+              /^hotfix\/.+/,
+              /^release\/v?\d+\.\d+\.\d+/,
+              /^develop$/,
+              /^main$/,
+            ];
+
+            const isValid = validPatterns.some(p => p.test(head));
+            if (!isValid) {
+              core.warning(
+                `Branch '${head}' doesn't follow Gitflow naming convention. ` +
+                `Expected: feature/*, fix/*, bugfix/*, hotfix/*, release/v*`
+              );
+            }
+
+      - name: Require PR description
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+            if (body.trim().length < 20) {
+              core.setFailed(
+                'PR description is too short. Please provide a meaningful description ' +
+                'with a summary of changes and test plan.'
+              );
+            }
