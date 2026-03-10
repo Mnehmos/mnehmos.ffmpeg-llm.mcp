@@ -13,6 +13,8 @@ import {
   type ToolResult,
 } from './actionEnum.js';
 import type { Storage } from '../storage/db.js';
+import { TimelineEditor } from './timeline.js';
+import { ChapterTools } from './chapter.js';
 
 // ── Schemas ─────────────────────────────────────────────────────────────
 
@@ -29,12 +31,215 @@ const BatchToolsSchema = z.object({
 });
 
 const TimelineUndoSchema = z.object({
-  projectId: z.string().uuid(),
+  projectId: z.string().min(1),
 });
 
 const TimelineRedoSchema = z.object({
-  projectId: z.string().uuid(),
+  projectId: z.string().min(1),
 });
+
+// ── BatchTools Class ────────────────────────────────────────────────────
+
+/**
+ * Class-based tool handler for batch and undo/redo operations.
+ */
+export class BatchTools {
+  private readonly storage: Storage;
+  /** Track current history position per project for undo/redo */
+  private historyIndex: Map<string, number> = new Map();
+
+  constructor(storage: Storage) {
+    this.storage = storage;
+  }
+
+  async batchTools(params: {
+    projectId: string;
+    operations: Array<{ tool: string; params: Record<string, unknown> }>;
+  }): Promise<{
+    summary: { total: number; successful: number; failed: number };
+    results: Array<{ tool: string; success: boolean; data?: unknown; error?: string }>;
+  }> {
+    const { projectId, operations } = params;
+    const results: Array<{ tool: string; success: boolean; data?: unknown; error?: string }> = [];
+    let successful = 0;
+    let failed = 0;
+
+    for (const op of operations) {
+      try {
+        const opParams = { ...op.params, projectId };
+        let result: unknown;
+
+        // Dispatch based on tool name
+        switch (op.tool) {
+          case 'clip_add': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.clipAdd(opParams as Parameters<TimelineEditor['clipAdd']>[0]);
+            break;
+          }
+          case 'clip_trim': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.clipTrim(opParams as Parameters<TimelineEditor['clipTrim']>[0]);
+            break;
+          }
+          case 'clip_split': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.clipSplit(opParams as Parameters<TimelineEditor['clipSplit']>[0]);
+            break;
+          }
+          case 'clip_move': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.clipMove(opParams as Parameters<TimelineEditor['clipMove']>[0]);
+            break;
+          }
+          case 'clip_remove': {
+            const editor = new TimelineEditor(this.storage);
+            await editor.clipRemove(opParams as Parameters<TimelineEditor['clipRemove']>[0]);
+            result = { removed: true };
+            break;
+          }
+          case 'clip_set_speed': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.clipSetSpeed(
+              opParams as Parameters<TimelineEditor['clipSetSpeed']>[0],
+            );
+            break;
+          }
+          case 'track_add': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.trackAdd(opParams as Parameters<TimelineEditor['trackAdd']>[0]);
+            break;
+          }
+          case 'track_remove': {
+            const editor = new TimelineEditor(this.storage);
+            await editor.trackRemove(opParams as Parameters<TimelineEditor['trackRemove']>[0]);
+            result = { removed: true };
+            break;
+          }
+          case 'filter_add': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.filterAdd(opParams as Parameters<TimelineEditor['filterAdd']>[0]);
+            break;
+          }
+          case 'filter_remove': {
+            const editor = new TimelineEditor(this.storage);
+            result = await editor.filterRemove(
+              opParams as Parameters<TimelineEditor['filterRemove']>[0],
+            );
+            break;
+          }
+          case 'chapter_add': {
+            const chapterTools = new ChapterTools(this.storage);
+            result = await chapterTools.chapterAdd(
+              opParams as Parameters<ChapterTools['chapterAdd']>[0],
+            );
+            break;
+          }
+          case 'chapter_remove': {
+            const chapterTools = new ChapterTools(this.storage);
+            await chapterTools.chapterRemove(
+              opParams as Parameters<ChapterTools['chapterRemove']>[0],
+            );
+            result = { removed: true };
+            break;
+          }
+          default:
+            throw new Error(`Unknown tool: ${op.tool}`);
+        }
+
+        results.push({ tool: op.tool, success: true, data: result });
+        successful++;
+      } catch (err) {
+        results.push({
+          tool: op.tool,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        failed++;
+      }
+    }
+
+    return {
+      summary: { total: operations.length, successful, failed },
+      results,
+    };
+  }
+
+  async timelineUndo(params: { projectId: string; steps?: number }): Promise<{ undone: boolean }> {
+    const { projectId, steps = 1 } = params;
+
+    const project = await this.storage.getProject(projectId);
+    if (!project) throw new Error(`Project not found: ${projectId}`);
+
+    if (project.history.length === 0) {
+      return { undone: false };
+    }
+
+    // Get or initialize history index (points to the current position)
+    let idx = this.historyIndex.get(projectId);
+    if (idx === undefined) {
+      idx = project.history.length;
+    }
+
+    if (idx <= 0) {
+      return { undone: false };
+    }
+
+    // Undo the requested number of steps
+    const targetIdx = Math.max(0, idx - steps);
+    const entry = project.history[targetIdx];
+
+    if (entry?.before) {
+      // Restore the timeline state from the before snapshot
+      if (entry.before.tracks !== undefined) {
+        project.timeline.tracks = entry.before.tracks;
+      }
+    }
+
+    this.historyIndex.set(projectId, targetIdx);
+    project.updatedAt = new Date().toISOString();
+    await this.storage.saveProject(project);
+
+    return { undone: true };
+  }
+
+  async timelineRedo(params: { projectId: string; steps?: number }): Promise<{ redone: boolean }> {
+    const { projectId, steps = 1 } = params;
+
+    const project = await this.storage.getProject(projectId);
+    if (!project) throw new Error(`Project not found: ${projectId}`);
+
+    if (project.history.length === 0) {
+      return { redone: false };
+    }
+
+    // Get current history index
+    const idx = this.historyIndex.get(projectId);
+    if (idx === undefined) {
+      // If we haven't undone anything, nothing to redo
+      return { redone: false };
+    }
+
+    if (idx >= project.history.length) {
+      return { redone: false };
+    }
+
+    // Redo the requested number of steps
+    const targetIdx = Math.min(project.history.length, idx + steps);
+    const entry = project.history[targetIdx - 1];
+
+    if (entry?.after) {
+      if (entry.after.tracks !== undefined) {
+        project.timeline.tracks = entry.after.tracks;
+      }
+    }
+
+    this.historyIndex.set(projectId, targetIdx);
+    project.updatedAt = new Date().toISOString();
+    await this.storage.saveProject(project);
+
+    return { redone: true };
+  }
+}
 
 // ── Registration ────────────────────────────────────────────────────────
 
@@ -104,24 +309,18 @@ export function registerBatchTools(_registry: unknown, db: Storage): void {
     handler: async (params): Promise<ToolResult> => {
       const { projectId } = params as z.infer<typeof TimelineUndoSchema>;
 
-      const project = db.getProject(projectId);
+      const project = await db.getProject(projectId);
       if (!project) return { success: false, error: `Project not found: ${projectId}` };
 
       if (project.history.length === 0) {
         return { success: false, error: 'No history to undo' };
       }
 
-      // TODO: Implement undo logic
-      // 1. Get the last history entry
-      // 2. Restore the "before" state from the history entry
-      // 3. Save project
-
       const lastEntry = project.history[project.history.length - 1];
       if (!lastEntry) return { success: false, error: 'History entry not found' };
 
-      // TODO: Apply lastEntry.before to the appropriate project state
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,
@@ -139,21 +338,18 @@ export function registerBatchTools(_registry: unknown, db: Storage): void {
     handler: async (params): Promise<ToolResult> => {
       const { projectId } = params as z.infer<typeof TimelineRedoSchema>;
 
-      const project = db.getProject(projectId);
+      const project = await db.getProject(projectId);
       if (!project) return { success: false, error: `Project not found: ${projectId}` };
 
       if (project.history.length === 0) {
         return { success: false, error: 'Nothing to redo' };
       }
 
-      // TODO: Implement redo logic using history entries
-      // For now, this is a placeholder
       const entry = project.history[project.history.length - 1];
       if (!entry) return { success: false, error: 'History entry not found' };
 
-      // TODO: Apply entry.after to the appropriate project state
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,

@@ -9,24 +9,101 @@ import { v4 as uuidv4 } from 'uuid';
 import { ToolAction, ToolCategory, registerTool, type ToolResult } from './actionEnum.js';
 import type { Storage } from '../storage/db.js';
 import type { Chapter } from '../schemas/timeline.js';
+import type { Project } from '../schemas/project.js';
 
 // ── Schemas ─────────────────────────────────────────────────────────────
 
 const ChapterAddSchema = z.object({
-  projectId: z.string().uuid(),
+  projectId: z.string().min(1),
   title: z.string().min(1).describe('Chapter title'),
-  timelineStart: z.number().nonnegative().describe('Start time on the timeline in seconds'),
+  timelineStart: z.number().describe('Start time on the timeline in seconds'),
   metadata: z.record(z.any()).optional(),
 });
 
 const ChapterRemoveSchema = z.object({
-  projectId: z.string().uuid(),
-  chapterId: z.string().uuid(),
+  projectId: z.string().min(1),
+  chapterId: z.string().min(1),
 });
 
 const ChapterListSchema = z.object({
-  projectId: z.string().uuid(),
+  projectId: z.string().min(1),
 });
+
+// ── ChapterTools Class ──────────────────────────────────────────────────
+
+/**
+ * Class-based tool handler for chapter operations.
+ */
+export class ChapterTools {
+  private readonly storage: Storage;
+
+  constructor(storage: Storage) {
+    this.storage = storage;
+  }
+
+  private async loadProject(projectId: string): Promise<Project> {
+    const project = await this.storage.getProject(projectId);
+    if (!project) throw new Error(`Project not found: ${projectId}`);
+    return project;
+  }
+
+  async chapterAdd(params: {
+    projectId: string;
+    title: string;
+    timelineStart: number;
+    metadata?: Record<string, unknown>;
+  }): Promise<{ chapter: Chapter }> {
+    const { projectId, title, timelineStart, metadata } = params;
+
+    const project = await this.loadProject(projectId);
+
+    // Validate timestamp
+    if (timelineStart < 0) {
+      throw new Error(`Chapter start time ${timelineStart}s is negative`);
+    }
+    if (timelineStart > project.timeline.duration) {
+      throw new Error(
+        `Chapter start time ${timelineStart}s exceeds timeline duration ${project.timeline.duration}s`,
+      );
+    }
+
+    const chapter: Chapter = {
+      id: uuidv4(),
+      title,
+      timelineStart,
+      metadata: metadata ?? {},
+    };
+
+    project.timeline.chapters.push(chapter);
+    // Sort chapters by start time
+    project.timeline.chapters.sort((a, b) => a.timelineStart - b.timelineStart);
+    project.updatedAt = new Date().toISOString();
+    await this.storage.saveProject(project);
+
+    return { chapter };
+  }
+
+  async chapterRemove(params: { projectId: string; chapterId: string }): Promise<void> {
+    const { projectId, chapterId } = params;
+
+    const project = await this.loadProject(projectId);
+    const idx = project.timeline.chapters.findIndex((c) => c.id === chapterId);
+    if (idx === -1) throw new Error(`Chapter not found: ${chapterId}`);
+
+    project.timeline.chapters.splice(idx, 1);
+    project.updatedAt = new Date().toISOString();
+    await this.storage.saveProject(project);
+  }
+
+  async chapterList(params: { projectId: string }): Promise<{ chapters: Chapter[] }> {
+    const { projectId } = params;
+
+    const project = await this.loadProject(projectId);
+    const sorted = [...project.timeline.chapters].sort((a, b) => a.timelineStart - b.timelineStart);
+
+    return { chapters: sorted };
+  }
+}
 
 // ── Registration ────────────────────────────────────────────────────────
 
@@ -36,45 +113,25 @@ const ChapterListSchema = z.object({
  * @param db - Storage instance
  */
 export function registerChapterTools(_registry: unknown, db: Storage): void {
+  const tools = new ChapterTools(db);
+
   registerTool({
     action: ToolAction.CHAPTER_ADD,
     category: ToolCategory.CHAPTER,
     description: 'Add a chapter marker to the timeline',
     schema: ChapterAddSchema,
     handler: async (params): Promise<ToolResult> => {
-      const { projectId, title, timelineStart, metadata } = params as z.infer<
-        typeof ChapterAddSchema
-      >;
-
-      const project = db.getProject(projectId);
-      if (!project) return { success: false, error: `Project not found: ${projectId}` };
-
-      // Validate timestamp is within timeline duration (if timeline has content)
-      if (project.timeline.duration > 0 && timelineStart > project.timeline.duration) {
+      const p = params as z.infer<typeof ChapterAddSchema>;
+      try {
+        const result = await tools.chapterAdd(p);
         return {
-          success: false,
-          error: `Chapter start time ${timelineStart}s exceeds timeline duration ${project.timeline.duration}s`,
+          success: true,
+          data: { chapterId: result.chapter.id },
+          summary: `Added chapter "${result.chapter.title}" at ${result.chapter.timelineStart}s`,
         };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
       }
-
-      const chapter: Chapter = {
-        id: uuidv4(),
-        title,
-        timelineStart,
-        metadata: metadata ?? {},
-      };
-
-      project.timeline.chapters.push(chapter);
-      // Sort chapters by start time
-      project.timeline.chapters.sort((a, b) => a.timelineStart - b.timelineStart);
-      project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
-
-      return {
-        success: true,
-        data: { chapterId: chapter.id },
-        summary: `Added chapter "${title}" at ${timelineStart}s`,
-      };
     },
   });
 
@@ -84,19 +141,13 @@ export function registerChapterTools(_registry: unknown, db: Storage): void {
     description: 'Remove a chapter marker from the timeline',
     schema: ChapterRemoveSchema,
     handler: async (params): Promise<ToolResult> => {
-      const { projectId, chapterId } = params as z.infer<typeof ChapterRemoveSchema>;
-
-      const project = db.getProject(projectId);
-      if (!project) return { success: false, error: `Project not found: ${projectId}` };
-
-      const idx = project.timeline.chapters.findIndex((c) => c.id === chapterId);
-      if (idx === -1) return { success: false, error: `Chapter not found: ${chapterId}` };
-
-      const removed = project.timeline.chapters.splice(idx, 1)[0];
-      project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
-
-      return { success: true, summary: `Removed chapter "${removed.title}"` };
+      const p = params as z.infer<typeof ChapterRemoveSchema>;
+      try {
+        await tools.chapterRemove(p);
+        return { success: true, summary: 'Removed chapter' };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
     },
   });
 
@@ -106,16 +157,17 @@ export function registerChapterTools(_registry: unknown, db: Storage): void {
     description: 'List all chapter markers in the timeline',
     schema: ChapterListSchema,
     handler: async (params): Promise<ToolResult> => {
-      const { projectId } = params as z.infer<typeof ChapterListSchema>;
-
-      const project = db.getProject(projectId);
-      if (!project) return { success: false, error: `Project not found: ${projectId}` };
-
-      return {
-        success: true,
-        data: project.timeline.chapters,
-        summary: `${project.timeline.chapters.length} chapter(s)`,
-      };
+      const p = params as z.infer<typeof ChapterListSchema>;
+      try {
+        const result = await tools.chapterList(p);
+        return {
+          success: true,
+          data: result.chapters,
+          summary: `${result.chapters.length} chapter(s)`,
+        };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
     },
   });
 }

@@ -6,13 +6,9 @@
 
 // ── Types ───────────────────────────────────────────────────────────────
 
-/** A single recorded cost entry */
-interface CostEntry {
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-  timestamp: string;
+/** Options for constructing a BudgetTracker */
+export interface BudgetTrackerOptions {
+  maxBudgetUsd: number;
 }
 
 // ── Budget Tracker ──────────────────────────────────────────────────────
@@ -22,8 +18,8 @@ interface CostEntry {
  *
  * @example
  * ```ts
- * const budget = new BudgetTracker(5.0); // $5 max
- * budget.recordCost('gemini-2.0-flash', 1000, 500);
+ * const budget = new BudgetTracker({ maxBudgetUsd: 5.0 });
+ * budget.recordCost('gemini-2.0-flash', 0.01);
  * if (budget.canAfford(0.10)) {
  *   // proceed with API call
  * }
@@ -31,37 +27,36 @@ interface CostEntry {
  */
 export class BudgetTracker {
   private readonly maxBudgetUsd: number;
-  private totalSpentUsd: number = 0;
-  private readonly entries: CostEntry[] = [];
+  private spent: number = 0;
+  private readonly costsByModel: Record<string, number> = {};
 
   /**
-   * @param maxBudgetUsd - Maximum allowed budget in USD
+   * @param options - Configuration options including max budget
    */
-  constructor(maxBudgetUsd: number) {
-    this.maxBudgetUsd = maxBudgetUsd;
+  constructor(options: BudgetTrackerOptions | number) {
+    if (typeof options === 'number') {
+      this.maxBudgetUsd = options;
+    } else {
+      this.maxBudgetUsd = options.maxBudgetUsd;
+    }
   }
 
   /**
    * Record the cost of an API call.
    * @param model - Model identifier
-   * @param inputTokens - Number of input tokens used
-   * @param outputTokens - Number of output tokens used
+   * @param costUsd - Cost in USD
    */
-  recordCost(model: string, inputTokens: number, outputTokens: number): void {
-    // TODO: Use model-specific pricing for accurate cost calculation
-    const inputCostPer1k = model.includes('gemini') ? 0.00015 : 0.001;
-    const outputCostPer1k = model.includes('gemini') ? 0.0006 : 0.003;
-    const costUsd = (inputTokens / 1000) * inputCostPer1k + (outputTokens / 1000) * outputCostPer1k;
+  recordCost(model: string, costUsd: number): void {
+    this.costsByModel[model] = (this.costsByModel[model] ?? 0) + costUsd;
+    this.spent += costUsd;
+  }
 
-    this.entries.push({
-      model,
-      inputTokens,
-      outputTokens,
-      costUsd,
-      timestamp: new Date().toISOString(),
-    });
-
-    this.totalSpentUsd += costUsd;
+  /**
+   * Get the total amount spent so far in USD.
+   * @returns Total spent
+   */
+  totalSpent(): number {
+    return this.spent;
   }
 
   /**
@@ -70,23 +65,7 @@ export class BudgetTracker {
    * @returns true if the cost would not exceed the budget
    */
   canAfford(estimatedCostUsd: number): boolean {
-    return this.totalSpentUsd + estimatedCostUsd <= this.maxBudgetUsd;
-  }
-
-  /**
-   * Get the total amount spent so far in USD.
-   * @returns Total spent
-   */
-  getSpent(): number {
-    return this.totalSpentUsd;
-  }
-
-  /**
-   * Get the remaining budget in USD.
-   * @returns Remaining budget
-   */
-  getRemainingBudget(): number {
-    return Math.max(0, this.maxBudgetUsd - this.totalSpentUsd);
+    return this.spent + estimatedCostUsd <= this.maxBudgetUsd;
   }
 
   /**
@@ -94,18 +73,24 @@ export class BudgetTracker {
    * @returns Map of model name to total cost in USD
    */
   getCostBreakdown(): Record<string, number> {
-    const breakdown: Record<string, number> = {};
-    for (const entry of this.entries) {
-      breakdown[entry.model] = (breakdown[entry.model] ?? 0) + entry.costUsd;
-    }
-    return breakdown;
+    return { ...this.costsByModel };
   }
 
   /**
-   * Get the total number of API calls made.
-   * @returns Number of recorded cost entries
+   * Get the remaining budget in USD.
+   * @returns Remaining budget (never negative)
    */
-  getCallCount(): number {
-    return this.entries.length;
+  remainingBudget(): number {
+    return Math.max(0, this.maxBudgetUsd - this.spent);
+  }
+
+  /**
+   * Reset all recorded costs and breakdown.
+   */
+  reset(): void {
+    this.spent = 0;
+    for (const key of Object.keys(this.costsByModel)) {
+      delete this.costsByModel[key];
+    }
   }
 }

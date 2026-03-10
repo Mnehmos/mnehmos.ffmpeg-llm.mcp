@@ -188,13 +188,20 @@ describe('FilterGraphBuilder', () => {
 
       const graph = builder.build();
 
-      // Extract all labels (text between square brackets)
-      const labels = graph.match(/\[[^\]]+\]/g) ?? [];
-      const _uniqueLabels = new Set(labels);
-
-      // Each output label should be unique
-      // Input labels like [0:v] can repeat, but output labels should not
-      const outputLabels = labels.filter((l) => !l.match(/^\[\d+:[va]\]$/));
+      // Each chain segment assigns output label(s) at the end.
+      // In FFmpeg filter_complex, labels appear as both output (end of chain)
+      // and input (start of another chain for concat). We check that
+      // output labels (those produced by chains) are never assigned twice.
+      const segments = graph.split(';');
+      const outputLabels: string[] = [];
+      for (const seg of segments) {
+        // Extract trailing labels from each segment (output positions)
+        const trailing = seg.match(/(\[[^\]]+\])+$/);
+        if (trailing) {
+          const segLabels = trailing[0].match(/\[[^\]]+\]/g) ?? [];
+          outputLabels.push(...segLabels);
+        }
+      }
       const uniqueOutputLabels = new Set(outputLabels);
       expect(outputLabels.length).toBe(uniqueOutputLabels.size);
     });

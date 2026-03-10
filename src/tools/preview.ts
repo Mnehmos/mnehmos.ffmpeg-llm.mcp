@@ -79,8 +79,8 @@ export function registerPreviewTools(
 
       return {
         success: true,
-        data: { outputPath, durationMs: result.durationMs },
-        summary: `Preview rendered: ${start}s-${end}s (${result.durationMs}ms)`,
+        data: { outputPath },
+        summary: `Preview rendered: ${start}s-${end}s`,
       };
     },
   });
