@@ -35,33 +35,40 @@ export interface AuditEntry {
   timestamp: string;
 }
 
+// ── Storage Interface ──────────────────────────────────────────────────
+
+/**
+ * Interface for storage implementations.
+ * Both sync (SqliteStorage) and async (MockStorage) implementations are supported.
+ * Callers should use await to handle both cases.
+ */
+
+export interface Storage {
+  saveProject(project: Project): void;
+  getProject(id: string): Project | null;
+  listProjects(): Project[] | ProjectSummary[];
+  deleteProject(id: string): void | boolean;
+  saveRenderJob(job: RenderJob): void;
+  getRenderJob(id: string): RenderJob | null;
+  updateRenderStatus(id: string, status: RenderJobStatus, progress?: number): void;
+  appendAudit(entry: unknown): void;
+  getAuditLog?(): unknown[];
+}
+
 // ── Storage Class ───────────────────────────────────────────────────────
 
 /**
  * SQLite storage layer for all persistent project data.
- *
- * Tables:
- * - `projects`: id TEXT PK, data JSON, created_at TEXT, updated_at TEXT
- * - `render_jobs`: id TEXT PK, project_id TEXT, status TEXT, progress REAL,
- *   output_path TEXT, preset_id TEXT, created_at TEXT, updated_at TEXT, error TEXT
- * - `audit_log`: id TEXT PK, project_id TEXT, tool TEXT, params_json TEXT,
- *   result_json TEXT, timestamp TEXT
  */
-export class Storage {
+export class SqliteStorage implements Storage {
   private db: Database.Database;
 
-  /**
-   * Opens or creates the SQLite database at the given path.
-   * Creates tables if they do not exist.
-   * @param dbPath - Path to the SQLite database file
-   */
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this._createTables();
   }
 
-  /** Create tables if they don't already exist */
   private _createTables(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (
@@ -98,10 +105,6 @@ export class Storage {
     `);
   }
 
-  /**
-   * Save or update a project in the database.
-   * @param project - Full project data
-   */
   saveProject(project: Project): void {
     const now = new Date().toISOString();
     const stmt = this.db.prepare(`
@@ -112,24 +115,14 @@ export class Storage {
     stmt.run(project.id, JSON.stringify(project), project.createdAt, now);
   }
 
-  /**
-   * Retrieve a project by ID.
-   * @param id - Project UUID
-   * @returns The project or null if not found
-   */
   getProject(id: string): Project | null {
     const row = this.db.prepare('SELECT data FROM projects WHERE id = ?').get(id) as
       | { data: string }
       | undefined;
     if (!row) return null;
-    // TODO: Validate with ProjectSchema.parse() for safety
     return JSON.parse(row.data) as Project;
   }
 
-  /**
-   * List all projects as lightweight summaries.
-   * @returns Array of project summaries sorted by updated_at descending
-   */
   listProjects(): ProjectSummary[] {
     const rows = this.db.prepare('SELECT data FROM projects ORDER BY updated_at DESC').all() as {
       data: string;
@@ -148,19 +141,12 @@ export class Storage {
     });
   }
 
-  /**
-   * Delete a project by ID.
-   * @param id - Project UUID
-   */
   deleteProject(id: string): void {
     this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
   }
 
-  /**
-   * Save or update a render job.
-   * @param job - Render job data
-   */
-  saveRenderJob(job: RenderJob): void {
+  saveRenderJob(job: unknown): void {
+    const j = job as RenderJob;
     const stmt = this.db.prepare(`
       INSERT INTO render_jobs (id, project_id, status, progress, output_path, preset_id, created_at, updated_at, error)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -171,23 +157,18 @@ export class Storage {
         error = excluded.error
     `);
     stmt.run(
-      job.id,
-      job.projectId,
-      job.status,
-      job.progress,
-      job.outputPath,
-      job.presetId ?? null,
-      job.createdAt,
-      job.updatedAt,
-      job.error ?? null,
+      j.id,
+      j.projectId,
+      j.status,
+      j.progress,
+      j.outputPath,
+      j.presetId ?? null,
+      j.createdAt,
+      j.updatedAt,
+      j.error ?? null,
     );
   }
 
-  /**
-   * Retrieve a render job by ID.
-   * @param id - Render job UUID
-   * @returns The render job or null if not found
-   */
   getRenderJob(id: string): RenderJob | null {
     const row = this.db.prepare('SELECT * FROM render_jobs WHERE id = ?').get(id) as
       | Record<string, unknown>
@@ -206,12 +187,6 @@ export class Storage {
     };
   }
 
-  /**
-   * Update the status and optional progress of a render job.
-   * @param id - Render job UUID
-   * @param status - New status
-   * @param progress - Optional progress (0.0 - 1.0)
-   */
   updateRenderStatus(id: string, status: RenderJobStatus, progress?: number): void {
     const now = new Date().toISOString();
     if (progress !== undefined) {
@@ -225,26 +200,19 @@ export class Storage {
     }
   }
 
-  /**
-   * Append an entry to the audit log.
-   * @param entry - Audit log entry
-   */
-  appendAudit(entry: AuditEntry): void {
+  appendAudit(entry: unknown): void {
+    const e = entry as AuditEntry;
     const stmt = this.db.prepare(`
       INSERT INTO audit_log (id, project_id, tool, params_json, result_json, timestamp)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
-    stmt.run(
-      entry.id,
-      entry.projectId,
-      entry.tool,
-      entry.paramsJson,
-      entry.resultJson,
-      entry.timestamp,
-    );
+    stmt.run(e.id, e.projectId, e.tool, e.paramsJson, e.resultJson, e.timestamp);
   }
 
-  /** Close the database connection */
+  getAuditLog(): unknown[] {
+    return this.db.prepare('SELECT * FROM audit_log ORDER BY timestamp DESC').all();
+  }
+
   close(): void {
     this.db.close();
   }

@@ -9,7 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { ToolAction, ToolCategory, registerTool, type ToolResult } from './actionEnum.js';
 import type { Storage } from '../storage/db.js';
 import { TrackTypeEnum, FilterTypeEnum } from '../schemas/timeline.js';
-import type { Clip, Track } from '../schemas/timeline.js';
+import type { Clip, Track, Filter } from '../schemas/timeline.js';
 import type { Project } from '../schemas/project.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -23,7 +23,6 @@ function clipDuration(clip: Clip): number {
 
 /**
  * Recalculate the total timeline duration from all clips across all tracks.
- * @param project - The project to update
  */
 function recalcDuration(project: Project): void {
   let maxEnd = 0;
@@ -38,11 +37,6 @@ function recalcDuration(project: Project): void {
 
 /**
  * Check if a new clip would overlap with existing clips on a track.
- * @param track - The track to check
- * @param start - Proposed clip start time
- * @param duration - Proposed clip duration
- * @param excludeClipId - Optional clip ID to exclude (for move operations)
- * @returns true if there is an overlap
  */
 function hasOverlap(
   track: Track,
@@ -56,6 +50,21 @@ function hasOverlap(
     const cEnd = c.timelineStart + clipDuration(c);
     return start < cEnd && end > c.timelineStart;
   });
+}
+
+/**
+ * Find a clip across all tracks in a project.
+ */
+function findClipInProject(
+  project: Project,
+  clipId: string,
+): { track: Track; clip: Clip; trackIndex: number } | null {
+  for (let i = 0; i < project.timeline.tracks.length; i++) {
+    const track = project.timeline.tracks[i];
+    const clip = track.clips.find((c) => c.id === clipId);
+    if (clip) return { track, clip, trackIndex: i };
+  }
+  return null;
 }
 
 // ── Schemas ─────────────────────────────────────────────────────────────
@@ -145,6 +154,303 @@ const FilterRemoveSchema = z.object({
   filterIndex: z.number().int().nonnegative(),
 });
 
+// ── TimelineEditor Class ────────────────────────────────────────────────
+
+/**
+ * Class-based tool handler for timeline editing operations.
+ */
+export class TimelineEditor {
+  private readonly storage: Storage;
+
+  constructor(storage: Storage) {
+    this.storage = storage;
+  }
+
+  private async loadProject(projectId: string): Promise<Project> {
+    const project = await this.storage.getProject(projectId);
+    if (!project) throw new Error(`Project not found: ${projectId}`);
+    return project;
+  }
+
+  private async saveProject(project: Project): Promise<void> {
+    project.updatedAt = new Date().toISOString();
+    await this.storage.saveProject(project);
+  }
+
+  async clipAdd(params: {
+    projectId: string;
+    assetId: string;
+    trackId: string;
+    timelineStart: number;
+    sourceRange?: { start: number; end: number };
+  }): Promise<{ clip: Clip }> {
+    const { projectId, assetId, trackId, timelineStart, sourceRange } = params;
+
+    const project = await this.loadProject(projectId);
+    const track = project.timeline.tracks.find((t) => t.id === trackId);
+    if (!track) throw new Error(`Track not found: ${trackId}`);
+
+    const asset = project.assets.find((a) => a.id === assetId);
+    if (!asset) throw new Error(`Asset not found: ${assetId}`);
+
+    const range = sourceRange ?? { start: 0, end: asset.duration ?? 0 };
+    const dur = range.end - range.start;
+
+    // Check overlap
+    if (hasOverlap(track, timelineStart, dur)) {
+      throw new Error('Clip would overlap with existing clip on this track');
+    }
+
+    const trackIndex = project.timeline.tracks.indexOf(track);
+    const clip: Clip = {
+      id: uuidv4(),
+      assetId,
+      sourceRange: range,
+      timelineStart,
+      trackIndex,
+      speed: 1.0,
+      volume: 1.0,
+      opacity: 1.0,
+      filters: [],
+      metadata: {},
+    };
+
+    track.clips.push(clip);
+    recalcDuration(project);
+    await this.saveProject(project);
+
+    return { clip };
+  }
+
+  async clipTrim(params: {
+    projectId: string;
+    clipId: string;
+    sourceStart?: number;
+    sourceEnd?: number;
+  }): Promise<{ clip: Clip }> {
+    const { projectId, clipId, sourceStart, sourceEnd } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { clip } = found;
+    const asset = project.assets.find((a) => a.id === clip.assetId);
+
+    if (sourceStart !== undefined) {
+      clip.sourceRange = { start: sourceStart, end: clip.sourceRange.end };
+    }
+    if (sourceEnd !== undefined) {
+      // Validate against asset duration
+      if (asset && asset.duration !== undefined && sourceEnd > asset.duration) {
+        throw new Error(`Trim extends beyond asset duration (${asset.duration}s)`);
+      }
+      clip.sourceRange = { start: clip.sourceRange.start, end: sourceEnd };
+    }
+
+    recalcDuration(project);
+    await this.saveProject(project);
+
+    return { clip };
+  }
+
+  async clipSplit(params: {
+    projectId: string;
+    clipId: string;
+    splitAt: number;
+  }): Promise<{ clips: [Clip, Clip] }> {
+    const { projectId, clipId, splitAt } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { track, clip } = found;
+    const duration = clipDuration(clip);
+    const clipEnd = clip.timelineStart + duration;
+
+    if (splitAt <= clip.timelineStart || splitAt >= clipEnd) {
+      throw new Error(
+        `Split point ${splitAt}s is outside clip range [${clip.timelineStart}, ${clipEnd})`,
+      );
+    }
+
+    // Calculate split point in source time
+    const firstTimelineDuration = splitAt - clip.timelineStart;
+    const firstSourceDuration = firstTimelineDuration * clip.speed;
+    const splitSourceTime = clip.sourceRange.start + firstSourceDuration;
+
+    // Modify original clip (becomes the first half)
+    const originalEnd = clip.sourceRange.end;
+    clip.sourceRange = { start: clip.sourceRange.start, end: splitSourceTime };
+
+    // Create second clip
+    const secondClip: Clip = {
+      id: uuidv4(),
+      assetId: clip.assetId,
+      sourceRange: { start: splitSourceTime, end: originalEnd },
+      timelineStart: splitAt,
+      trackIndex: clip.trackIndex,
+      speed: clip.speed,
+      volume: clip.volume,
+      opacity: clip.opacity,
+      filters: clip.filters.map((f) => ({ ...f })),
+      metadata: { ...clip.metadata },
+    };
+
+    track.clips.push(secondClip);
+    await this.saveProject(project);
+
+    return { clips: [clip, secondClip] };
+  }
+
+  async clipMove(params: {
+    projectId: string;
+    clipId: string;
+    timelineStart?: number;
+    trackId?: string;
+  }): Promise<{ clip: Clip }> {
+    const { projectId, clipId, timelineStart, trackId } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { track: sourceTrack, clip } = found;
+
+    const destTrack = trackId ? project.timeline.tracks.find((t) => t.id === trackId) : sourceTrack;
+    if (!destTrack) throw new Error(`Target track not found: ${trackId}`);
+
+    const newStart = timelineStart ?? clip.timelineStart;
+
+    // Check overlap on destination (exclude self)
+    if (hasOverlap(destTrack, newStart, clipDuration(clip), clip.id)) {
+      throw new Error('Clip would overlap at new position');
+    }
+
+    // Move between tracks if needed
+    if (trackId && trackId !== sourceTrack.id) {
+      sourceTrack.clips = sourceTrack.clips.filter((c) => c.id !== clipId);
+      destTrack.clips.push(clip);
+    }
+
+    clip.timelineStart = newStart;
+    recalcDuration(project);
+    await this.saveProject(project);
+
+    return { clip };
+  }
+
+  async clipRemove(params: { projectId: string; clipId: string }): Promise<void> {
+    const { projectId, clipId } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { track } = found;
+    track.clips = track.clips.filter((c) => c.id !== clipId);
+    recalcDuration(project);
+    await this.saveProject(project);
+  }
+
+  async clipSetSpeed(params: {
+    projectId: string;
+    clipId: string;
+    speed: number;
+  }): Promise<{ clip: Clip }> {
+    const { projectId, clipId, speed } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { clip } = found;
+    clip.speed = speed;
+    recalcDuration(project);
+    await this.saveProject(project);
+
+    return { clip };
+  }
+
+  async trackAdd(params: {
+    projectId: string;
+    name: string;
+    type: string;
+  }): Promise<{ track: Track }> {
+    const { projectId, name, type } = params;
+
+    const project = await this.loadProject(projectId);
+
+    const track: Track = {
+      id: uuidv4(),
+      name,
+      type: type as Track['type'],
+      clips: [],
+      muted: false,
+      locked: false,
+      visible: true,
+    };
+
+    project.timeline.tracks.push(track);
+    await this.saveProject(project);
+
+    return { track };
+  }
+
+  async trackRemove(params: { projectId: string; trackId: string }): Promise<void> {
+    const { projectId, trackId } = params;
+
+    const project = await this.loadProject(projectId);
+    const idx = project.timeline.tracks.findIndex((t) => t.id === trackId);
+    if (idx === -1) throw new Error(`Track not found: ${trackId}`);
+
+    project.timeline.tracks.splice(idx, 1);
+    recalcDuration(project);
+    await this.saveProject(project);
+  }
+
+  async filterAdd(params: {
+    projectId: string;
+    clipId: string;
+    filter: Filter;
+  }): Promise<{ clip: Clip }> {
+    const { projectId, clipId, filter } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { clip } = found;
+    clip.filters.push(filter);
+    await this.saveProject(project);
+
+    return { clip };
+  }
+
+  async filterRemove(params: {
+    projectId: string;
+    clipId: string;
+    filterIndex: number;
+  }): Promise<{ clip: Clip }> {
+    const { projectId, clipId, filterIndex } = params;
+
+    const project = await this.loadProject(projectId);
+    const found = findClipInProject(project, clipId);
+    if (!found) throw new Error(`Clip not found: ${clipId}`);
+
+    const { clip } = found;
+    if (filterIndex < 0 || filterIndex >= clip.filters.length) {
+      throw new Error(`Filter index ${filterIndex} out of range`);
+    }
+
+    clip.filters.splice(filterIndex, 1);
+    await this.saveProject(project);
+
+    return { clip };
+  }
+}
+
 // ── Registration ────────────────────────────────────────────────────────
 
 /**
@@ -159,7 +465,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
     trackId: string,
     clipId?: string,
   ): { project: Project; track: Track; clip?: Clip; error?: string } {
-    const project = db.getProject(projectId);
+    const project = db.getProject(projectId) as Project | null;
     if (!project) return { project: null!, track: null!, error: `Project not found: ${projectId}` };
     const track = project.timeline.tracks.find((t) => t.id === trackId);
     if (!track) return { project, track: null!, error: `Track not found: ${trackId}` };
@@ -178,7 +484,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
     schema: TrackAddSchema,
     handler: async (params): Promise<ToolResult> => {
       const { projectId, name, type } = params as z.infer<typeof TrackAddSchema>;
-      const project = db.getProject(projectId);
+      const project = await db.getProject(projectId);
       if (!project) return { success: false, error: `Project not found: ${projectId}` };
 
       const track: Track = {
@@ -192,7 +498,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       };
       project.timeline.tracks.push(track);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,
@@ -209,7 +515,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
     schema: TrackRemoveSchema,
     handler: async (params): Promise<ToolResult> => {
       const { projectId, trackId } = params as z.infer<typeof TrackRemoveSchema>;
-      const project = db.getProject(projectId);
+      const project = await db.getProject(projectId);
       if (!project) return { success: false, error: `Project not found: ${projectId}` };
 
       const idx = project.timeline.tracks.findIndex((t) => t.id === trackId);
@@ -218,7 +524,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       const removed = project.timeline.tracks.splice(idx, 1)[0];
       recalcDuration(project);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,
@@ -234,19 +540,18 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
     schema: TrackReorderSchema,
     handler: async (params): Promise<ToolResult> => {
       const { projectId, trackId, newOrder } = params as z.infer<typeof TrackReorderSchema>;
-      const project = db.getProject(projectId);
+      const project = await db.getProject(projectId);
       if (!project) return { success: false, error: `Project not found: ${projectId}` };
 
       const idx = project.timeline.tracks.findIndex((t) => t.id === trackId);
       if (idx === -1) return { success: false, error: `Track not found: ${trackId}` };
 
-      // Remove and reinsert at the new position
       const [track] = project.timeline.tracks.splice(idx, 1);
       const insertAt = Math.min(newOrder, project.timeline.tracks.length);
       project.timeline.tracks.splice(insertAt, 0, track);
 
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Track "${track.name}" reordered to position ${newOrder}` };
     },
@@ -264,11 +569,9 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       const { project, track, error } = getProjectTrackClip(projectId, trackId);
       if (error) return { success: false, error };
 
-      // Validate asset exists
       const asset = project.assets.find((a) => a.id === assetId);
       if (!asset) return { success: false, error: `Asset not found: ${assetId}` };
 
-      // Check overlap
       if (hasOverlap(track, timelineStart, duration)) {
         return { success: false, error: 'Clip would overlap with existing clip on this track' };
       }
@@ -290,7 +593,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       track.clips.push(clip);
       recalcDuration(project);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,
@@ -313,7 +616,6 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       const { project, clip, error } = getProjectTrackClip(projectId, trackId, clipId);
       if (error || !clip) return { success: false, error: error ?? 'Clip not found' };
 
-      // TODO: Validate new values don't exceed asset duration
       if (newStart !== undefined) clip.timelineStart = newStart;
       if (newSourceEnd !== undefined) {
         clip.sourceRange = { start: clip.sourceRange.start, end: newSourceEnd };
@@ -324,7 +626,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
 
       recalcDuration(project);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Trimmed clip ${clipId}` };
     },
@@ -348,12 +650,10 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
         : track;
       if (!destTrack) return { success: false, error: `Target track not found: ${targetTrackId}` };
 
-      // Check overlap on destination
       if (hasOverlap(destTrack, newTimelineStart, clipDuration(clip), clip.id)) {
         return { success: false, error: 'Clip would overlap at new position' };
       }
 
-      // Move between tracks if needed
       if (targetTrackId && targetTrackId !== trackId) {
         track.clips = track.clips.filter((c) => c.id !== clipId);
         destTrack.clips.push(clip);
@@ -362,7 +662,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       clip.timelineStart = newTimelineStart;
       recalcDuration(project);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Moved clip to ${newTimelineStart}s` };
     },
@@ -388,16 +688,13 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
         };
       }
 
-      // Calculate split point in source time
       const firstTimelineDuration = splitAt - clip.timelineStart;
       const firstSourceDuration = firstTimelineDuration * clip.speed;
       const splitSourceTime = clip.sourceRange.start + firstSourceDuration;
 
-      // Modify original clip (becomes the first half)
       const originalEnd = clip.sourceRange.end;
       clip.sourceRange = { start: clip.sourceRange.start, end: splitSourceTime };
 
-      // Create second clip
       const secondClip: Clip = {
         id: uuidv4(),
         assetId: clip.assetId,
@@ -413,7 +710,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
 
       track.clips.push(secondClip);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,
@@ -439,7 +736,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       track.clips.splice(idx, 1);
       recalcDuration(project);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Removed clip ${clipId}` };
     },
@@ -460,7 +757,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
       clip.speed = speed;
       recalcDuration(project);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Set clip speed to ${speed}x` };
     },
@@ -478,7 +775,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
 
       clip.volume = volume;
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Set clip volume to ${volume}` };
     },
@@ -509,7 +806,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
 
       clip.filters.push(filter);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return {
         success: true,
@@ -541,7 +838,7 @@ export function registerTimelineTools(_registry: unknown, db: Storage): void {
 
       clip.filters.splice(filterIndex, 1);
       project.updatedAt = new Date().toISOString();
-      db.saveProject(project);
+      await db.saveProject(project);
 
       return { success: true, summary: `Removed filter at index ${filterIndex}` };
     },

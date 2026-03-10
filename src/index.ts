@@ -11,9 +11,9 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { zodToJsonSchema } from 'zod-to-json-schema';
 
 import { loadConfig } from './config.js';
-import { Storage } from './storage/db.js';
-import { FFmpegRunner } from './engine/ffmpeg.js';
-import { FFprobeRunner } from './engine/ffprobe.js';
+import { SqliteStorage } from './storage/db.js';
+import { RealFFmpegRunner } from './engine/ffmpeg.js';
+import { RealFFprobeRunner } from './engine/ffprobe.js';
 import { RenderQueue } from './engine/render-queue.js';
 import { OpenRouterClient } from './llm/openrouter-client.js';
 import { FrameSampler } from './llm/frame-sampler.js';
@@ -41,12 +41,12 @@ async function main(): Promise<void> {
   await ensureDir(config.workDir);
 
   // ── Infrastructure ──────────────────────────────────────────────────
-  const db = new Storage(config.dbPath);
-  const ffmpeg = new FFmpegRunner(config.ffmpegPath);
-  const ffprobe = new FFprobeRunner(config.ffprobePath);
+  const db = new SqliteStorage(config.dbPath);
+  const ffmpeg = new RealFFmpegRunner(config.ffmpegPath);
+  const ffprobe = new RealFFprobeRunner(config.ffprobePath);
   const renderQueue = new RenderQueue(ffmpeg, db);
   const sampler = new FrameSampler();
-  const budget = new BudgetTracker(1.0);
+  const budget = new BudgetTracker({ maxBudgetUsd: 1.0 });
 
   // LLM client (optional — only if API key is configured)
   const llmClient = config.openrouterApiKey

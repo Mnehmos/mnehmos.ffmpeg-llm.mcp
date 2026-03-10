@@ -60,27 +60,39 @@ export interface ProbeResult {
   streams: StreamInfo[];
 }
 
-// ── FFprobe Runner ──────────────────────────────────────────────────────
+// ── FFprobe Runner Interface ────────────────────────────────────────────
+
+/** Interface for FFprobe execution (injectable for testing) */
+export interface FFprobeRunner {
+  probe(filePath: string): Promise<ProbeResult>;
+}
+
+// ── FFprobe Wrapper ─────────────────────────────────────────────────────
 
 /**
- * Wraps the ffprobe CLI for extracting media file metadata.
+ * Wrapper around an FFprobeRunner (real or mock) for media inspection.
  */
-export class FFprobeRunner {
+export class FFprobeWrapper {
+  private readonly runner: FFprobeRunner;
+
+  constructor(runner: FFprobeRunner) {
+    this.runner = runner;
+  }
+
+  async probe(filePath: string): Promise<ProbeResult> {
+    return this.runner.probe(filePath);
+  }
+}
+
+// ── Real FFprobe Runner (for production) ────────────────────────────────
+
+export class RealFFprobeRunner implements FFprobeRunner {
   private readonly binaryPath: string;
 
-  /**
-   * @param ffprobePath - Path to the ffprobe binary. Defaults to 'ffprobe'.
-   */
   constructor(ffprobePath?: string) {
     this.binaryPath = ffprobePath ?? 'ffprobe';
   }
 
-  /**
-   * Run a full probe on a media file, returning format and stream info.
-   * Invokes: ffprobe -v quiet -print_format json -show_format -show_streams <file>
-   * @param filePath - Absolute path to the media file
-   * @returns Parsed probe result
-   */
   async probe(filePath: string): Promise<ProbeResult> {
     const args = [
       '-v',
@@ -93,36 +105,10 @@ export class FFprobeRunner {
     ];
 
     const output = await this._run(args);
-    // TODO: Add error handling for malformed JSON
     const parsed = JSON.parse(output) as ProbeResult;
     return parsed;
   }
 
-  /**
-   * Get only the stream information for a media file.
-   * @param filePath - Absolute path to the media file
-   * @returns Array of stream info objects
-   */
-  async getStreams(filePath: string): Promise<StreamInfo[]> {
-    const result = await this.probe(filePath);
-    return result.streams;
-  }
-
-  /**
-   * Get the total duration of a media file in seconds.
-   * @param filePath - Absolute path to the media file
-   * @returns Duration in seconds
-   */
-  async getDuration(filePath: string): Promise<number> {
-    const result = await this.probe(filePath);
-    return parseFloat(result.format.duration);
-  }
-
-  /**
-   * Spawn ffprobe and capture stdout.
-   * @param args - Command-line arguments
-   * @returns stdout as a string
-   */
   private async _run(args: string[]): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       const proc = spawn(this.binaryPath, args, {

@@ -219,7 +219,8 @@ export function registerAnalysisTools(
       const asset = project.assets.find((a) => a.id === assetId);
       if (!asset) return { success: false, error: `Asset not found: ${assetId}` };
 
-      const duration = await ffprobe.getDuration(asset.path);
+      const probeResult = await ffprobe.probe(asset.path);
+      const duration = parseFloat(probeResult.format.duration);
 
       return {
         success: true,

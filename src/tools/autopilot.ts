@@ -93,7 +93,7 @@ export function registerAutopilotTools(
       if (!budget.canAfford(estimatedCost)) {
         return {
           success: false,
-          error: `Insufficient budget. Remaining: $${budget.getRemainingBudget().toFixed(4)}, estimated cost: $${estimatedCost.toFixed(4)}`,
+          error: `Insufficient budget. Remaining: $${budget.remainingBudget().toFixed(4)}, estimated cost: $${estimatedCost.toFixed(4)}`,
         };
       }
 
