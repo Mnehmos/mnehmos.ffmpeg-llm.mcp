@@ -61,7 +61,7 @@ async function main(): Promise<void> {
   registerPreviewTools(toolRegistry, db, ffmpeg, renderQueue);
   registerAnalysisTools(toolRegistry, db, ffmpeg, ffprobe);
   registerChessTools(toolRegistry, db, ffmpeg);
-  registerAutopilotTools(toolRegistry, db, llmClient, sampler, budget);
+  registerAutopilotTools(toolRegistry, db, llmClient, sampler, budget, ffmpeg);
   registerBatchTools(toolRegistry, db);
 
   // ── MCP Server ──────────────────────────────────────────────────────
