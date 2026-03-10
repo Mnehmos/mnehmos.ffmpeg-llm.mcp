@@ -76,6 +76,91 @@ export interface SilenceRegion {
  * @param ffmpeg - FFmpeg runner for filter-based analysis
  * @param ffprobe - FFprobe runner for metadata queries
  */
+// ── Parsing Helpers ─────────────────────────────────────────────────────
+
+const PEAK_RE = /Peak level dB:\s*([-\d.]+)/;
+const RMS_RE = /RMS level dB:\s*([-\d.]+)/;
+
+/**
+ * Parse FFmpeg astats filter output from stderr.
+ * Extracts peak level, RMS level, and dynamic range.
+ */
+export function parseAudioLevels(stderr: string): AudioLevelResult {
+  const peakMatch = PEAK_RE.exec(stderr);
+  const rmsMatch = RMS_RE.exec(stderr);
+
+  const peakDb = peakMatch ? parseFloat(peakMatch[1]) : 0;
+  const rmsDb = rmsMatch ? parseFloat(rmsMatch[1]) : 0;
+  const dynamicRange = Math.abs(peakDb - rmsDb);
+
+  return { peakDb, rmsDb, dynamicRange, rawOutput: stderr };
+}
+
+const SCENE_PTS_RE = /pts_time:([\d.]+)/g;
+const SCENE_SCORE_RE = /scene:([\d.]+)/g;
+
+/**
+ * Parse FFmpeg showinfo filter output for scene change timestamps.
+ * Looks for "pts_time:X.XXX" and optionally "scene:X.XXX" patterns.
+ */
+export function parseSceneChanges(stderr: string): SceneChange[] {
+  const changes: SceneChange[] = [];
+  const lines = stderr.split('\n');
+
+  for (const line of lines) {
+    if (!line.includes('pts_time')) continue;
+
+    const ptsMatch = /pts_time:([\d.]+)/.exec(line);
+    if (!ptsMatch) continue;
+
+    const scoreMatch = /scene:([\d.]+)/.exec(line);
+    changes.push({
+      timestamp: parseFloat(ptsMatch[1]),
+      score: scoreMatch ? parseFloat(scoreMatch[1]) : 1.0,
+    });
+  }
+
+  // Reset global regex state
+  SCENE_PTS_RE.lastIndex = 0;
+  SCENE_SCORE_RE.lastIndex = 0;
+
+  return changes;
+}
+
+const SILENCE_START_RE = /silence_start:\s*([\d.]+)/g;
+const SILENCE_END_RE = /silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)/g;
+
+/**
+ * Parse FFmpeg silencedetect output for silence regions.
+ * Matches "silence_start: X.XXX" and "silence_end: X.XXX | silence_duration: X.XXX".
+ */
+export function parseSilenceRegions(stderr: string): SilenceRegion[] {
+  const regions: SilenceRegion[] = [];
+  const starts: number[] = [];
+
+  // Collect all silence_start values
+  let match: RegExpExecArray | null;
+  SILENCE_START_RE.lastIndex = 0;
+  while ((match = SILENCE_START_RE.exec(stderr)) !== null) {
+    starts.push(parseFloat(match[1]));
+  }
+
+  // Collect all silence_end + duration values
+  let idx = 0;
+  SILENCE_END_RE.lastIndex = 0;
+  while ((match = SILENCE_END_RE.exec(stderr)) !== null) {
+    const end = parseFloat(match[1]);
+    const duration = parseFloat(match[2]);
+    const start = idx < starts.length ? starts[idx] : end - duration;
+    regions.push({ start, end, duration });
+    idx++;
+  }
+
+  return regions;
+}
+
+// ── Registration ────────────────────────────────────────────────────────
+
 export function registerAnalysisTools(
   _registry: unknown,
   db: Storage,
@@ -109,13 +194,7 @@ export function registerAnalysisTools(
 
       const ffResult = await ffmpeg.run(args);
 
-      // TODO: Parse astats output from stderr to extract peak, RMS, dynamic range
-      const audioLevels: AudioLevelResult = {
-        peakDb: 0,
-        rmsDb: 0,
-        dynamicRange: 0,
-        rawOutput: ffResult.stderr,
-      };
+      const audioLevels = parseAudioLevels(ffResult.stderr);
 
       return {
         success: true,
@@ -150,16 +229,13 @@ export function registerAnalysisTools(
         process.platform === 'win32' ? 'NUL' : '/dev/null',
       ];
 
-      void (await ffmpeg.run(args));
-
-      // TODO: Parse showinfo output from stderr to extract timestamps and scores
-      // Pattern: "pts_time:123.456" lines
-      const _sceneChanges: SceneChange[] = [];
+      const sceneResult = await ffmpeg.run(args);
+      const sceneChanges = parseSceneChanges(sceneResult.stderr);
 
       return {
         success: true,
-        data: { sceneChanges: _sceneChanges, threshold },
-        summary: `Detected ${_sceneChanges.length} scene change(s) at threshold ${threshold}`,
+        data: { sceneChanges, threshold },
+        summary: `Detected ${sceneChanges.length} scene change(s) at threshold ${threshold}`,
       };
     },
   });
@@ -191,16 +267,13 @@ export function registerAnalysisTools(
         process.platform === 'win32' ? 'NUL' : '/dev/null',
       ];
 
-      void (await ffmpeg.run(args));
-
-      // TODO: Parse silencedetect output from stderr
-      // Pattern: "silence_start: 1.234" and "silence_end: 5.678 | silence_duration: 4.444"
-      const _silenceRegions: SilenceRegion[] = [];
+      const silenceResult = await ffmpeg.run(args);
+      const silenceRegions = parseSilenceRegions(silenceResult.stderr);
 
       return {
         success: true,
-        data: { silenceRegions: _silenceRegions, noiseDb, minDuration },
-        summary: `Detected ${_silenceRegions.length} silence region(s)`,
+        data: { silenceRegions, noiseDb, minDuration },
+        summary: `Detected ${silenceRegions.length} silence region(s)`,
       };
     },
   });
