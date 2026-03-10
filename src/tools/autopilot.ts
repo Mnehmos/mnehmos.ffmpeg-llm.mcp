@@ -5,6 +5,7 @@
  */
 
 import { z } from 'zod';
+import { v4 as uuidv4 } from 'uuid';
 import {
   ToolAction,
   ToolCategory,
@@ -13,6 +14,7 @@ import {
   type ToolResult,
 } from './actionEnum.js';
 import type { Storage } from '../storage/db.js';
+import type { FFmpegRunner } from '../engine/ffmpeg.js';
 import { AnalysisTypeEnum } from '../schemas/autopilot.js';
 import type { AnalysisResult, EditSuggestion } from '../schemas/autopilot.js';
 import type { OpenRouterClient } from '../llm/openrouter-client.js';
@@ -52,15 +54,14 @@ const AutopilotConfigureSchema = z.object({
   maxBudgetUsd: z.number().nonnegative().optional(),
 });
 
+// ── In-memory suggestion store ──────────────────────────────────────────
+
+const suggestionStore = new Map<string, EditSuggestion>();
+
 // ── Registration ────────────────────────────────────────────────────────
 
 /**
  * Register all autopilot tools (4 total).
- * @param _registry - Unused
- * @param db - Storage instance
- * @param llmClient - OpenRouter API client
- * @param sampler - Frame sampler for vision analysis
- * @param budget - Budget tracker for cost control
  */
 export function registerAutopilotTools(
   _registry: unknown,
@@ -68,6 +69,7 @@ export function registerAutopilotTools(
   llmClient: OpenRouterClient,
   sampler: FrameSampler,
   budget: BudgetTracker,
+  ffmpeg: FFmpegRunner,
 ): void {
   registerTool({
     action: ToolAction.AUTOPILOT_ANALYZE,
@@ -89,7 +91,7 @@ export function registerAutopilotTools(
       if (!asset) return { success: false, error: `Asset not found: ${assetId}` };
 
       // Check budget before proceeding
-      const estimatedCost = 0.05; // TODO: Better cost estimation based on video length
+      const estimatedCost = 0.05;
       if (!budget.canAfford(estimatedCost)) {
         return {
           success: false,
@@ -99,24 +101,26 @@ export function registerAutopilotTools(
 
       let analysisResult: AnalysisResult;
 
-      // TODO: Implement actual LLM analysis calls
       switch (analysisType) {
         case 'scene_overview':
-          analysisResult = await analyzeSceneOverview(project, asset, llmClient, sampler);
+          analysisResult = await analyzeSceneOverview(project, asset, llmClient, sampler, ffmpeg);
           break;
         case 'highlight_detection':
-          analysisResult = await detectHighlights(project, asset, llmClient, sampler);
+          analysisResult = await detectHighlights(project, asset, llmClient, sampler, ffmpeg);
           break;
         case 'chapter_suggestion':
-          analysisResult = await suggestChapters(project, asset, llmClient, sampler);
+          analysisResult = await suggestChapters(project, asset, llmClient, sampler, ffmpeg);
           break;
         case 'thumbnail_candidates':
-          analysisResult = await selectThumbnails(project, asset, llmClient, sampler);
+          analysisResult = await selectThumbnails(project, asset, llmClient, sampler, ffmpeg);
           break;
         case 'edit_review':
           analysisResult = await reviewEdits(project, llmClient);
           break;
       }
+
+      // Track cost
+      budget.recordCost(analysisResult.model, analysisResult.costUsd);
 
       return {
         success: true,
@@ -141,14 +145,107 @@ export function registerAutopilotTools(
         return { success: false, error: 'Autopilot is not enabled for this project' };
       }
 
-      // TODO: Send project state + context to LLM, receive EditSuggestion[]
-      void context;
-      const _suggestions: EditSuggestion[] = [];
+      // Check budget
+      const estimatedCost = 0.03;
+      if (!budget.canAfford(estimatedCost)) {
+        return {
+          success: false,
+          error: `Insufficient budget. Remaining: $${budget.remainingBudget().toFixed(4)}`,
+        };
+      }
+
+      // Build project summary for LLM
+      const projectSummary = JSON.stringify(
+        {
+          name: project.name,
+          tracks: project.timeline.tracks.map((t) => ({
+            name: t.name,
+            type: t.type,
+            clipCount: t.clips.length,
+            clips: t.clips.map((c) => ({
+              id: c.id,
+              assetId: c.assetId,
+              timelineStart: c.timelineStart,
+              sourceRange: c.sourceRange,
+              speed: c.speed,
+              volume: c.volume,
+              filters: c.filters,
+            })),
+          })),
+          chapters: project.timeline.chapters,
+          duration: project.timeline.duration,
+          assetCount: project.assets.length,
+        },
+        null,
+        2,
+      );
+
+      const prompt = `Given this video project timeline, suggest specific edits to improve it.
+${context ? `Additional context: ${context}\n` : ''}
+Project state:
+${projectSummary}
+
+Return JSON with this schema:
+{
+  "suggestions": [
+    {
+      "toolAction": string,
+      "params": object,
+      "description": string,
+      "confidence": number,
+      "reasoning": string
+    }
+  ]
+}`;
+
+      const response = await llmClient.chat(
+        [
+          {
+            role: 'system',
+            content:
+              'You are a video editing assistant. Suggest specific tool actions to improve the project.',
+          },
+          { role: 'user', content: prompt },
+        ],
+        { model: project.autopilot.openrouterModel, responseFormat: { type: 'json_object' } },
+      );
+
+      const costUsd = llmClient.estimateCost(
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens,
+        response.model,
+      );
+      budget.recordCost(response.model, costUsd);
+
+      const parsed = JSON.parse(response.content) as {
+        suggestions?: Array<{
+          toolAction: string;
+          params: Record<string, unknown>;
+          description: string;
+          confidence: number;
+          reasoning?: string;
+        }>;
+      };
+
+      // Convert to EditSuggestion with IDs and store them
+      const suggestions: EditSuggestion[] = (parsed.suggestions ?? []).map((s) => {
+        const suggestion: EditSuggestion = {
+          id: uuidv4(),
+          toolAction: s.toolAction,
+          params: s.params,
+          description: s.description,
+          confidence: Math.min(1, Math.max(0, s.confidence)),
+          applied: false,
+          reasoning: s.reasoning,
+        };
+        suggestionStore.set(suggestion.id, suggestion);
+        return suggestion;
+      });
 
       return {
         success: true,
-        data: { suggestions: _suggestions },
-        summary: `Generated ${_suggestions.length} edit suggestion(s) — TODO: implement`,
+        data: { suggestions, costUsd },
+        summary: `Generated ${suggestions.length} edit suggestion(s) (cost: $${costUsd.toFixed(4)})`,
       };
     },
   });
@@ -166,15 +263,41 @@ export function registerAutopilotTools(
       const project = db.getProject(projectId);
       if (!project) return { success: false, error: `Project not found: ${projectId}` };
 
-      // TODO: Look up stored suggestions, execute each via executeTool
       const results: Array<{ suggestionId: string; success: boolean; error?: string }> = [];
 
-      for (const _id of suggestionIds) {
-        // TODO: Retrieve suggestion, call executeTool with its action and params
-        results.push({ suggestionId: _id, success: false, error: 'Not implemented' });
-      }
+      for (const id of suggestionIds) {
+        const suggestion = suggestionStore.get(id);
+        if (!suggestion) {
+          results.push({ suggestionId: id, success: false, error: 'Suggestion not found' });
+          continue;
+        }
 
-      void executeTool; // Will be used when implemented
+        if (suggestion.applied) {
+          results.push({ suggestionId: id, success: false, error: 'Already applied' });
+          continue;
+        }
+
+        // Map toolAction string to ToolAction enum
+        const action = suggestion.toolAction as ToolAction;
+
+        try {
+          const toolResult = await executeTool(action, {
+            projectId,
+            ...suggestion.params,
+          });
+
+          if (toolResult.success) {
+            suggestion.applied = true;
+            suggestionStore.set(id, suggestion);
+            results.push({ suggestionId: id, success: true });
+          } else {
+            results.push({ suggestionId: id, success: false, error: toolResult.error });
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          results.push({ suggestionId: id, success: false, error: message });
+        }
+      }
 
       const successCount = results.filter((r) => r.success).length;
       return {
