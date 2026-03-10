@@ -4,7 +4,7 @@
 
 import type { FFmpegRunner, FFmpegResult } from '@/engine/ffmpeg';
 import type { FFprobeRunner, ProbeResult } from '@/engine/ffprobe';
-import type { Storage } from '@/storage/db';
+import type { Storage, RenderJob, RenderJobStatus } from '@/storage/db';
 import type { Project } from '@/schemas/project';
 import { SAMPLE_FFPROBE_OUTPUT } from './fixtures';
 
@@ -107,7 +107,7 @@ export class MockStorage implements Storage {
   calls: RecordedCall[] = [];
 
   private projects = new Map<string, Project>();
-  private renderJobs = new Map<string, unknown>();
+  private renderJobs = new Map<string, RenderJob>();
   private auditLog: unknown[] = [];
 
   // -- Project operations ---------------------------------------------------
@@ -135,16 +135,29 @@ export class MockStorage implements Storage {
 
   // -- Render job operations ------------------------------------------------
 
-  async saveRenderJob(job: unknown): Promise<void> {
+  saveRenderJob(job: RenderJob): void {
     this.calls.push({ method: 'saveRenderJob', args: [job], timestamp: Date.now() });
-    const j = job as { id: string };
-    this.renderJobs.set(j.id, structuredClone(job));
+    this.renderJobs.set(job.id, structuredClone(job));
   }
 
-  async getRenderJob(id: string): Promise<unknown | null> {
+  getRenderJob(id: string): RenderJob | null {
     this.calls.push({ method: 'getRenderJob', args: [id], timestamp: Date.now() });
     const j = this.renderJobs.get(id);
     return j ? structuredClone(j) : null;
+  }
+
+  updateRenderStatus(id: string, status: RenderJobStatus, progress?: number): void {
+    this.calls.push({
+      method: 'updateRenderStatus',
+      args: [id, status, progress],
+      timestamp: Date.now(),
+    });
+    const job = this.renderJobs.get(id);
+    if (job) {
+      job.status = status;
+      if (progress !== undefined) job.progress = progress;
+      job.updatedAt = new Date().toISOString();
+    }
   }
 
   // -- Audit log ------------------------------------------------------------

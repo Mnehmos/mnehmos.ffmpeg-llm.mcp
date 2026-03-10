@@ -172,22 +172,40 @@ export class RenderQueue {
     outputPath: string,
     preset?: ExportPreset,
   ): Promise<void> {
-    // TODO: Implement actual render execution
-    // 1. Update status to 'running'
-    // 2. Build args via buildRenderCommand
-    // 3. Use ffmpeg.runWithProgress to track progress
-    // 4. Update db with progress periodically
-    // 5. On success: status = 'complete', progress = 1.0
-    // 6. On failure: status = 'failed' with error message
-    // 7. Clean up activeJobs entry
+    const active = this.activeJobs.get(jobId);
 
+    // Update status to running
     this.db.updateRenderStatus(jobId, 'running');
 
-    // Placeholder — actual implementation will spawn FFmpeg
+    // Build FFmpeg args
     const args = buildRenderCommand(project, outputPath, preset);
-    void args;
-    void this.ffmpeg; // TODO: Use this.ffmpeg.runWithProgress(args, onProgress)
 
+    // Check for early cancellation
+    if (active?.cancelled) {
+      this.db.updateRenderStatus(jobId, 'cancelled');
+      this.activeJobs.delete(jobId);
+      return;
+    }
+
+    // Execute the FFmpeg render
+    const result = await this.ffmpeg.run(args);
+
+    // Check for cancellation during render
+    if (active?.cancelled) {
+      this.db.updateRenderStatus(jobId, 'cancelled');
+      this.activeJobs.delete(jobId);
+      return;
+    }
+
+    if (result.exitCode !== 0) {
+      this.db.updateRenderStatus(jobId, 'failed');
+      this.activeJobs.delete(jobId);
+      throw new Error(
+        `FFmpeg render failed (exit ${result.exitCode}): ${result.stderr.slice(0, 500)}`,
+      );
+    }
+
+    // Success
     this.db.updateRenderStatus(jobId, 'complete', 1.0);
     this.activeJobs.delete(jobId);
   }

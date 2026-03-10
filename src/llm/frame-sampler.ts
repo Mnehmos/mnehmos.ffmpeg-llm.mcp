@@ -74,9 +74,23 @@ export class FrameSampler {
       throw new Error(`Frame sampling failed: ${result.stderr.slice(0, 500)}`);
     }
 
-    // TODO: Read generated frame files and build SampledFrame array
-    // Parse frame count from ffmpeg output
+    // Read generated frame files — FFmpeg names them frame_0001.jpg, frame_0002.jpg, etc.
     const frames: SampledFrame[] = [];
+    let frameIdx = 1;
+
+    while (true) {
+      const framePath = join(this.tempDir, `frame_${String(frameIdx).padStart(4, '0')}.jpg`);
+      try {
+        const imageBuffer = await readFile(framePath);
+        const timestamp = (frameIdx - 1) * intervalSeconds;
+        frames.push({ timestamp, imagePath: framePath, imageBuffer });
+        frameIdx++;
+      } catch {
+        // No more frame files
+        break;
+      }
+    }
+
     return frames;
   }
 
